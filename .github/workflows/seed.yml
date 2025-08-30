@@ -1,0 +1,979 @@
+name: Seed project
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate project files
+        run: |
+          set -euo pipefail
+          mkdir -p app/api/countries app/api/leagues app/api/seasons app/api/fixtures app/api/standings app/api/insights app/api/match/[id]/summary app/api/export/match/[id]
+          mkdir -p app/match/[id] app/standings app/robots.txt app/sitemap.xml
+          mkdir -p components core/utils core/metrics core/adapters public prisma .github/workflows
+
+          # --- root ---
+          cat > package.json <<'EOF'
+          {
+            "name": "stat-calc-globale",
+            "private": true,
+            "scripts": { "dev": "next dev", "build": "next build", "start": "next start", "lint": "next lint" },
+            "dependencies": {
+              "next": "14.2.5",
+              "react": "18.2.0",
+              "react-dom": "18.2.0",
+              "recharts": "2.12.7",
+              "tailwindcss": "3.4.9",
+              "clsx": "2.1.1",
+              "zod": "3.23.8",
+              "dayjs": "1.11.11",
+              "@react-pdf/renderer": "3.4.5"
+            },
+            "devDependencies": {
+              "typescript": "5.5.4",
+              "@types/node": "20.11.30",
+              "@types/react": "18.2.66",
+              "@types/react-dom": "18.2.22",
+              "postcss": "8.4.38",
+              "autoprefixer": "10.4.19",
+              "eslint": "8.57.0",
+              "eslint-config-next": "14.2.5"
+            }
+          }
+          EOF
+
+          cat > next.config.ts <<'EOF'
+          import type { NextConfig } from 'next';
+          const nextConfig: NextConfig = { reactStrictMode: true, experimental: { serverActions: false } };
+          export default nextConfig;
+          EOF
+
+          cat > tsconfig.json <<'EOF'
+          {
+            "compilerOptions": {
+              "target": "ES2020",
+              "lib": ["dom", "dom.iterable", "es2020"],
+              "allowJs": false,
+              "skipLibCheck": true,
+              "strict": true,
+              "noEmit": true,
+              "esModuleInterop": true,
+              "module": "esnext",
+              "moduleResolution": "bundler",
+              "resolveJsonModule": true,
+              "isolatedModules": true,
+              "jsx": "preserve",
+              "incremental": true,
+              "baseUrl": ".",
+              "paths": { "@/*": ["*"] }
+            },
+            "include": ["next-env.d.ts", "**/*.ts", "**/*.tsx"],
+            "exclude": ["node_modules"]
+          }
+          EOF
+
+          cat > tailwind.config.ts <<'EOF'
+          export default { content: ['./app/**/*.{ts,tsx}','./components/**/*.{ts,tsx}','./core/**/*.{ts,tsx}'], theme:{extend:{}}, plugins:[] }
+          EOF
+
+          cat > postcss.config.js <<'EOF'
+          export default { plugins: { tailwindcss: {}, autoprefixer: {} } }
+          EOF
+
+          cat > .gitignore <<'EOF'
+          /node_modules
+          /.next
+          /.vercel
+          .env*
+          .DS_Store
+          EOF
+
+          # Non committiamo la tua chiave vera per sicurezza: metto un placeholder
+          cat > .env.example <<'EOF'
+          API_FOOTBALL_BASE=https://api-football-v1.p.rapidapi.com/v3
+          RAPIDAPI_KEY=__PASTE_YOUR_RAPIDAPI_KEY__
+          RAPIDAPI_HOST=api-football-v1.p.rapidapi.com
+
+          DEFAULT_COUNTRY=Italy
+          DEFAULT_LEAGUE_ID=135
+          DEFAULT_SEASON=2024
+
+          DATABASE_URL=postgresql://postgres:postgres@localhost:5432/app?schema=public
+          REDIS_URL=redis://localhost:6379
+          NEXT_PUBLIC_BASE_URL=http://localhost:3000
+          EOF
+
+          cat > Dockerfile <<'EOF'
+          FROM node:20-alpine AS base
+          WORKDIR /app
+          COPY package.json package-lock.json* pnpm-lock.yaml* yarn.lock* ./
+          RUN if [ -f pnpm-lock.yaml ]; then npm i -g pnpm && pnpm i; elif [ -f yarn.lock ]; then yarn; else npm i; fi
+          COPY . .
+          RUN npm run build || (echo "Build failed: ensure correct package manager and deps" && exit 1)
+          EXPOSE 3000
+          CMD ["npm","start"]
+          EOF
+
+          cat > docker-compose.yml <<'EOF'
+          version: '3.9'
+          services:
+            web:
+              build: .
+              container_name: calcio-web
+              ports: ["3000:3000"]
+              environment:
+                - NODE_ENV=production
+                - API_FOOTBALL_BASE=${API_FOOTBALL_BASE}
+                - RAPIDAPI_KEY=${RAPIDAPI_KEY}
+                - RAPIDAPI_HOST=${RAPIDAPI_HOST}
+                - DATABASE_URL=${DATABASE_URL}
+                - REDIS_URL=${REDIS_URL}
+                - NEXT_PUBLIC_BASE_URL=${NEXT_PUBLIC_BASE_URL}
+            db:
+              image: postgres:16-alpine
+              container_name: calcio-db
+              restart: unless-stopped
+              ports: ["5432:5432"]
+              environment:
+                POSTGRES_DB: app
+                POSTGRES_USER: postgres
+                POSTGRES_PASSWORD: postgres
+              volumes:
+                - pgdata:/var/lib/postgresql/data
+            redis:
+              image: redis:7-alpine
+              container_name: calcio-redis
+              ports: ["6379:6379"]
+          volumes:
+            pgdata:
+          EOF
+
+          # --- prisma ---
+          mkdir -p prisma
+          cat > prisma/schema.prisma <<'EOF'
+          datasource db { provider = "postgresql" url = env("DATABASE_URL") }
+          generator client { provider = "prisma-client-js" }
+
+          enum SubscriptionPlan { FREE PRO }
+
+          model User {
+            id           String   @id @default(cuid())
+            email        String   @unique
+            createdAt    DateTime @default(now())
+            plan         SubscriptionPlan @default(FREE)
+            favorites    Favorite[]
+            alerts       Alert[]
+          }
+
+          model Favorite {
+            id        String   @id @default(cuid())
+            userId    String
+            type      String
+            targetId  String
+            createdAt DateTime @default(now())
+            user      User     @relation(fields: [userId], references: [id])
+          }
+
+          model Alert {
+            id        String   @id @default(cuid())
+            userId    String
+            kind      String
+            params    Json
+            active    Boolean  @default(true)
+            createdAt DateTime @default(now())
+            user      User     @relation(fields: [userId], references: [id])
+          }
+
+          model FixtureCache {
+            id        String   @id
+            payload   Json
+            updatedAt DateTime @updatedAt
+          }
+          EOF
+
+          # --- app globals/layout ---
+          mkdir -p app
+          cat > app/globals.css <<'EOF'
+          :root { color-scheme: light dark; }
+          body { font-family: system-ui, sans-serif; }
+          @media (prefers-color-scheme: dark){ body{ background:#0a0a0a; color:#e6e6e6;} }
+          .btn { display:inline-flex; align-items:center; gap:.5rem; border:1px solid #262626; border-radius:12px; padding:.5rem .75rem; font-size:.9rem; }
+          .card { border:1px solid #262626; border-radius:16px; padding:1rem; background:#121212; }
+          EOF
+
+          cat > app/layout.tsx <<'EOF'
+          import './globals.css';
+          import type { ReactNode } from 'react';
+          import Link from 'next/link';
+          export default function RootLayout({ children }: { children: ReactNode }) {
+            return (
+              <html lang="it">
+                <body className="min-h-dvh">
+                  <main className="mx-auto max-w-6xl p-4 space-y-6">
+                    <header className="flex items-center justify-between gap-3">
+                      <Link href="/" className="text-xl font-semibold">⚽ Statistiche Calcio Global</Link>
+                      <nav className="text-sm opacity-90 flex items-center gap-3">
+                        <Link className="btn" href="/">Home</Link>
+                        <Link className="btn" href="/standings">Standings</Link>
+                        <Link className="btn" href="/privacy">Privacy</Link>
+                        <Link className="btn" href="/terms">Terms</Link>
+                      </nav>
+                    </header>
+                    {children}
+                  </main>
+                </body>
+              </html>
+            );
+          }
+          EOF
+
+          # --- app pages ---
+          cat > app/page.tsx <<'EOF'
+          'use client';
+          import { useEffect, useState, useMemo } from 'react';
+          import LeagueSelector from '@/components/LeagueSelector';
+          import MatchCard from '@/components/MatchCard';
+          import Insights from '@/components/Insights';
+          import type { Fixture } from '@/core/adapters/types';
+
+          export default function Page(){
+            const [state, setState] = useState<{country:string;leagueId:string;season:number}|null>(null);
+            const [fixtures, setFixtures] = useState<Fixture[]>([]);
+            const range = useMemo(()=>{ const from = new Date(); const to = new Date(); to.setDate(from.getDate()+7); return { from: from.toISOString().slice(0,10), to: to.toISOString().slice(0,10)}; },[]);
+
+            useEffect(()=>{
+              if(!state) return;
+              const qs = new URLSearchParams({ leagueId: state.leagueId, season: String(state.season), from: range.from, to: range.to });
+              fetch(`/api/fixtures?${qs}`).then(r=>r.json()).then(setFixtures);
+            },[state, range]);
+
+            return (
+              <div className="grid gap-6">
+                <LeagueSelector onChange={setState} />
+                {state && <Insights leagueId={state.leagueId} season={state.season} />}
+                <section className="grid md:grid-cols-2 gap-4">
+                  {fixtures.length === 0 ? <div className="opacity-70">Nessuna partita nella finestra selezionata.</div> : fixtures.map(f=> <MatchCard key={f.id} f={f} />)}
+                </section>
+              </div>
+            );
+          }
+          EOF
+
+          mkdir -p app/standings
+          cat > app/standings/page.tsx <<'EOF'
+          'use client';
+          import { useEffect, useState } from 'react';
+          import LeagueSelector from '@/components/LeagueSelector';
+          import StandingsTable from '@/components/StandingsTable';
+          export default function StandingsPage(){
+            const [state, setState] = useState<{country:string;leagueId:string;season:number}|null>(null);
+            const [rows, setRows] = useState<any[]>([]);
+            useEffect(()=>{ if(!state) return; const qs = new URLSearchParams({ leagueId: state.leagueId, season: String(state.season) }); fetch(`/api/standings?${qs}`).then(r=>r.json()).then(setRows); },[state]);
+            return (
+              <div className="grid gap-6">
+                <LeagueSelector onChange={setState} />
+                <StandingsTable rows={rows} />
+              </div>
+            );
+          }
+          EOF
+
+          mkdir -p app/match/[id]
+          cat > app/match/[id]/page.tsx <<'EOF'
+          import Link from 'next/link';
+          async function fetchJSON(url: string){ const r = await fetch(url, { cache: 'no-store' }); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+          function Section({ title, children }:{ title:string; children: React.ReactNode }){ return (<section className="card"><h2 className="font-semibold mb-2">{title}</h2>{children}</section>); }
+          import Tabs from '@/components/Tabs';
+          import OddsTable from '@/components/OddsTable';
+          import InjuriesList from '@/components/InjuriesList';
+          import LineupsView from '@/components/LineupsView';
+          export default async function MatchDetail({ params }:{ params: { id: string } }){
+            const data = await fetchJSON(`${process.env.NEXT_PUBLIC_BASE_URL || ''}/api/match/${params.id}/summary`);
+            const tabs = [
+              { key:'form', label:'Forma & H2H', content:(
+                <div className="grid md:grid-cols-2 gap-4">
+                  <Section title="Indice di Forma">
+                    <p className="text-sm">Home: <b>{data.homeForm?.score ?? 0}</b>/100 • {data.homeForm?.short ?? '—'}</p>
+                    <p className="text-sm">Away: <b>{data.awayForm?.score ?? 0}</b>/100 • {data.awayForm?.short ?? '—'}</p>
+                  </Section>
+                  <Section title="Scontri Diretti (H2H)">
+                    <p className="text-sm">{data.h2h?.length ? data.h2h.map((x:string)=>x).join(' ') : '—'}</p>
+                  </Section>
+                </div>
+              )},
+              { key:'odds', label:'Quote', content:(<OddsTable odds={data.odds||[]} />)},
+              { key:'inj', label:'Assenze', content:(
+                <div className="grid md:grid-cols-2 gap-4">
+                  <InjuriesList title="Casa" items={data.injuries?.home||[]} />
+                  <InjuriesList title="Trasferta" items={data.injuries?.away||[]} />
+                </div>
+              )},
+              { key:'lineups', label:'Formazioni', content:(<LineupsView data={data.lineups} />)},
+            ];
+            return (
+              <div className="grid gap-4">
+                <Link href="/" className="text-sm opacity-80">← Torna indietro</Link>
+                <header className="grid gap-1">
+                  <h1 className="text-xl font-semibold">{data.home.name} vs {data.away.name}</h1>
+                  <p className="opacity-70 text-sm">{data.venue?.name ?? '—'}{data.venue?.city ? `, ${data.venue.city}`:''} • {new Date(data.dateUtc).toLocaleString()}</p>
+                </header>
+                <Tabs tabs={tabs} />
+              </div>
+            );
+          }
+          EOF
+
+          # --- simple pages ---
+          cat > app/privacy/page.tsx <<'EOF'
+          export default function Privacy(){
+            return (
+              <div className="card">
+                <h1 className="text-xl font-semibold mb-2">Privacy Policy</h1>
+                <p className="opacity-80 text-sm">Questa applicazione utilizza servizi di terze parti per dati sportivi. Non raccogliamo dati personali senza il tuo consenso esplicito.</p>
+              </div>
+            );
+          }
+          EOF
+
+          cat > app/terms/page.tsx <<'EOF'
+          export default function Terms(){
+            return (
+              <div className="card">
+                <h1 className="text-xl font-semibold mb-2">Termini di Servizio</h1>
+                <p className="opacity-80 text-sm">I dati sono forniti "così come sono". L'uso è soggetto ai limiti dei provider e alle normative locali.</p>
+              </div>
+            );
+          }
+          EOF
+
+          mkdir -p app/robots.txt app/sitemap.xml
+          cat > app/robots.txt/route.ts <<'EOF'
+          export function GET(){
+            const body = `User-agent: *
+          Allow: /
+          Sitemap: ${process.env.NEXT_PUBLIC_BASE_URL || ''}/sitemap.xml`;
+            return new Response(body, { headers: { 'content-type':'text/plain' }});
+          }
+          EOF
+
+          cat > app/sitemap.xml/route.ts <<'EOF'
+          export async function GET(){
+            const base = process.env.NEXT_PUBLIC_BASE_URL || '';
+            const now = new Date().toISOString();
+            const urls = ['', '/standings'].map(p=>`  <url><loc>${base}${p}</loc><lastmod>${now}</lastmod></url>`).join('\n');
+            const xml = `<?xml version="1.0" encoding="UTF-8"?>
+          <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          ${urls}
+          </urlset>`;
+            return new Response(xml, { headers: { 'content-type':'application/xml' }});
+          }
+          EOF
+
+          # --- components ---
+          cat > components/LeagueSelector.tsx <<'EOF'
+          'use client';
+          import { useEffect, useState } from 'react';
+          import clsx from 'clsx';
+          type Country = { id:string; name:string };
+          export default function LeagueSelector({ onChange }:{ onChange: (state:{ country:string; leagueId:string; season:number })=>void }){
+            const [countries, setCountries] = useState<Country[]>([]);
+            const [country, setCountry] = useState(process.env.DEFAULT_COUNTRY || 'Italy');
+            const [leagues, setLeagues] = useState<{id:string; name:string}[]>([]);
+            const [leagueId, setLeagueId] = useState(process.env.DEFAULT_LEAGUE_ID || '135');
+            const [seasons, setSeasons] = useState<number[]>([]);
+            const [season, setSeason] = useState(Number(process.env.DEFAULT_SEASON || 2024));
+            useEffect(()=>{ fetch('/api/countries').then(r=>r.json()).then(setCountries); },[]);
+            useEffect(()=>{ if(!country) return; fetch(`/api/leagues?country=${encodeURIComponent(country)}`).then(r=>r.json()).then(setLeagues); },[country]);
+            useEffect(()=>{ if(!leagueId) return; fetch(`/api/seasons?leagueId=${leagueId}`).then(r=>r.json()).then(setSeasons); },[leagueId]);
+            useEffect(()=>{ if(country && leagueId && season) onChange({ country, leagueId, season }); },[country, leagueId, season, onChange]);
+            return (
+              <div className="card grid gap-3">
+                <div className="grid md:grid-cols-3 gap-3">
+                  <select className="btn" value={country} onChange={e=>setCountry(e.target.value)}>
+                    {countries.map(c=>(<option key={c.id} value={c.id}>{c.name}</option>))}
+                  </select>
+                  <select className="btn" value={leagueId} onChange={e=>setLeagueId(e.target.value)}>
+                    {leagues.map(l=>(<option key={l.id} value={l.id}>{l.name}</option>))}
+                  </select>
+                  <select className="btn" value={season} onChange={e=>setSeason(Number(e.target.value))}>
+                    {seasons.map(s=>(<option key={s} value={s}>{s}</option>))}
+                  </select>
+                </div>
+                <div className={clsx('text-xs opacity-70')}>Seleziona paese, competizione e stagione.</div>
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/MatchCard.tsx <<'EOF'
+          'use client';
+          import Link from 'next/link';
+          import FormGauge from './FormGauge';
+          import Sparkline from './Sparkline';
+          import type { Fixture } from '@/core/adapters/types';
+          import { fmtLocal } from '@/core/utils/time';
+          export default function MatchCard({ f }: { f: Fixture }){
+            return (
+              <article className="card grid gap-2">
+                <header className="flex items-center justify-between">
+                  <div className="font-semibold truncate">{f.home.name} <span className="opacity-70">vs</span> {f.away.name}</div>
+                  <time dateTime={f.dateUtc} className="text-sm opacity-80">{fmtLocal(f.dateUtc, f.venue?.tz)}</time>
+                </header>
+                <p className="text-xs opacity-70">{f.venue?.name ?? '—'}{f.venue?.city ? `, ${f.venue.city}`:''} • {f.round ?? ''}</p>
+                <div className="grid grid-cols-2 gap-3">
+                  <FormGauge value={Math.round(((f.homeForm?.score ?? 0)+(f.awayForm?.score ?? 0))/2)} />
+                  <div className="justify-self-end"><Sparkline points={[10,30,20,40,25,50]} /></div>
+                </div>
+                <div className="flex gap-2">
+                  <Link href={`/match/${f.id}`} className="btn">Dettaglio</Link>
+                  <a className="btn" href={`/api/export/match/${f.id}`}>Export PDF</a>
+                </div>
+              </article>
+            );
+          }
+          EOF
+
+          cat > components/FormGauge.tsx <<'EOF'
+          'use client';
+          import { PieChart, Pie, Cell, Tooltip } from 'recharts';
+          export default function FormGauge({ value }: { value: number }) {
+            const data = [ { name: 'score', value }, { name: 'rest', value: Math.max(0, 100 - value) } ];
+            return (
+              <div className="flex items-center gap-3">
+                <PieChart width={96} height={96}>
+                  <Pie data={data} dataKey="value" innerRadius={30} outerRadius={45} startAngle={180} endAngle={0}>
+                    {data.map((_, i) => (<Cell key={i} />))}
+                  </Pie>
+                  <Tooltip />
+                </PieChart>
+                <span className="text-sm opacity-80">Indice forma: <b>{value}</b>/100</span>
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/Sparkline.tsx <<'EOF'
+          'use client';
+          import { LineChart, Line } from 'recharts';
+          export default function Sparkline({ points }:{ points: number[] }){
+            const data = points.map((v,i)=>({ i, v }));
+            return (
+              <LineChart width={140} height={48} data={data}>
+                <Line type="monotone" dataKey="v" dot={false} />
+              </LineChart>
+            );
+          }
+          EOF
+
+          cat > components/StandingsTable.tsx <<'EOF'
+          'use client';
+          export default function StandingsTable({ rows }:{ rows: any[] }){
+            if(!rows?.length) return <div className="opacity-70">Classifica non disponibile.</div>;
+            return (
+              <div className="card overflow-x-auto">
+                <table className="min-w-full text-sm">
+                  <thead className="text-left opacity-70">
+                    <tr><th className="px-2 py-1">#</th><th className="px-2 py-1">Squadra</th><th className="px-2 py-1">G</th><th className="px-2 py-1">V</th><th className="px-2 py-1">N</th><th className="px-2 py-1">P</th><th className="px-2 py-1">GF</th><th className="px-2 py-1">GS</th><th className="px-2 py-1">PT</th></tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r:any)=> (
+                      <tr key={r.team?.id} className="border-t border-neutral-800">
+                        <td className="px-2 py-1">{r.rank}</td>
+                        <td className="px-2 py-1">{r.team?.name}</td>
+                        <td className="px-2 py-1">{r.all?.played}</td>
+                        <td className="px-2 py-1">{r.all?.win}</td>
+                        <td className="px-2 py-1">{r.all?.draw}</td>
+                        <td className="px-2 py-1">{r.all?.lose}</td>
+                        <td className="px-2 py-1">{r.all?.goals?.for}</td>
+                        <td className="px-2 py-1">{r.all?.goals?.against}</td>
+                        <td className="px-2 py-1 font-semibold">{r.points}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/Insights.tsx <<'EOF'
+          'use client';
+          import { useEffect, useState } from 'react';
+          export default function Insights({ leagueId, season }:{ leagueId:string; season:number }){
+            const [items, setItems] = useState<{type:string;text:string}[]>([]);
+            useEffect(()=>{ if(!leagueId||!season) return; const qs = new URLSearchParams({ leagueId, season: String(season) }); fetch(`/api/insights?${qs}`).then(r=>r.json()).then(d=>setItems(d.insights||[])); },[leagueId,season]);
+            if(!items.length) return null;
+            return (
+              <div className="card grid gap-2">
+                <h2 className="font-semibold">Smart Insights</h2>
+                <ul className="list-disc pl-5 text-sm">
+                  {items.map((it,i)=>(<li key={i}>{it.text}</li>))}
+                </ul>
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/OddsTable.tsx <<'EOF'
+          'use client';
+          export default function OddsTable({ odds }:{ odds: { market:string; outcomes:{ name:string; value:number }[] }[] }){
+            if(!odds?.length) return <div className="opacity-70">Quote non disponibili.</div>;
+            return (
+              <div className="grid gap-3">
+                {odds.map((m,i)=> (
+                  <div key={i} className="card">
+                    <div className="font-semibold mb-2">{m.market}</div>
+                    <div className="flex flex-wrap gap-3 text-sm">
+                      {m.outcomes.map((o,j)=>(<span key={j} className="btn">{o.name}: <b className="ml-1">{o.value}</b></span>))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/InjuriesList.tsx <<'EOF'
+          'use client';
+          export default function InjuriesList({ title, items }:{ title:string; items: { player:string; position?:string; status?:string; expected_return?:string }[] }){
+            return (
+              <div className="card">
+                <h3 className="font-semibold mb-2">{title}</h3>
+                {(!items || items.length===0) ? <div className="text-sm opacity-70">Nessuna assenza registrata.</div> : (
+                  <ul className="text-sm grid gap-1">
+                    {items.map((x,i)=>(<li key={i}><b>{x.player}</b> {x.position?`(${x.position})`:''} — {x.status||'—'} {x.expected_return?`• rientro: ${x.expected_return}`:''}</li>))}
+                  </ul>
+                )}
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/LineupsView.tsx <<'EOF'
+          'use client';
+          export default function LineupsView({ data }:{ data?: { home?: { formation?:string; xi?:string[]; bench?:string[] }, away?: { formation?:string; xi?:string[]; bench?:string[] } } }){
+            if(!data) return <div className="opacity-70">Formazioni non disponibili.</div>;
+            const Col = ({side,team}:{side:'home'|'away';team?:{ formation?:string; xi?:string[]; bench?:string[] }})=> (
+              <div className="grid gap-2">
+                <div className="font-semibold">{side==='home'?'Casa':'Trasferta'} {team?.formation?`• ${team.formation}`:''}</div>
+                <div className="text-sm"><b>XI:</b> {team?.xi?.length?team.xi.join(', '):'—'}</div>
+                <div className="text-sm opacity-80"><b>Panchina:</b> {team?.bench?.length?team.bench.join(', '):'—'}</div>
+              </div>
+            );
+            return (
+              <div className="card grid md:grid-cols-2 gap-4">
+                <Col side='home' team={data.home} />
+                <Col side='away' team={data.away} />
+              </div>
+            );
+          }
+          EOF
+
+          cat > components/Tabs.tsx <<'EOF'
+          'use client';
+          import { useState } from 'react';
+          export default function Tabs({ tabs }:{ tabs: { key:string; label:string; content: React.ReactNode }[] }){
+            const [k,setK]=useState(tabs[0]?.key);
+            return (
+              <div className="grid gap-3">
+                <div className="flex flex-wrap gap-2">
+                  {tabs.map(t=> <button key={t.key} onClick={()=>setK(t.key)} className={`btn ${k===t.key?'opacity-100':'opacity-60'}`}>{t.label}</button>)}
+                </div>
+                <div>{tabs.find(t=>t.key===k)?.content}</div>
+              </div>
+            );
+          }
+          EOF
+
+          # --- API routes ---
+          cat > app/api/countries/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          export async function GET(){ const data = await adapter.getCountries(); return NextResponse.json(data); }
+          EOF
+
+          cat > app/api/leagues/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          export async function GET(req: Request){
+            const { searchParams } = new URL(req.url);
+            const country = searchParams.get('country')||'';
+            const data = await adapter.getLeagues(country);
+            return NextResponse.json(data);
+          }
+          EOF
+
+          cat > app/api/seasons/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          export async function GET(req: Request){
+            const { searchParams } = new URL(req.url);
+            const leagueId = searchParams.get('leagueId')||'';
+            const data = await adapter.getSeasons(leagueId);
+            return NextResponse.json(data);
+          }
+          EOF
+
+          cat > app/api/fixtures/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          export async function GET(req: Request){
+            const { searchParams } = new URL(req.url);
+            const leagueId = searchParams.get('leagueId')||'';
+            const season = Number(searchParams.get('season')||'0');
+            const from = searchParams.get('from')||'';
+            const to = searchParams.get('to')||'';
+            const data = await adapter.getFixtures({ leagueId, season, from, to });
+            return NextResponse.json(data);
+          }
+          EOF
+
+          cat > app/api/standings/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          export async function GET(req: Request){
+            const { searchParams } = new URL(req.url);
+            const leagueId = searchParams.get('leagueId')||'';
+            const season = Number(searchParams.get('season')||'0');
+            const data = await adapter.getStandings(leagueId, season);
+            return NextResponse.json(data);
+          }
+          EOF
+
+          cat > app/api/insights/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          export async function GET(req: Request){
+            const { searchParams } = new URL(req.url);
+            const leagueId = searchParams.get('leagueId')||''; const season = Number(searchParams.get('season')||'0');
+            const rows = await adapter.getStandings(leagueId, season);
+            if(!rows?.length) return NextResponse.json({ insights: [] });
+            let bestAttack = rows[0], bestDefense = rows[0];
+            for(const r of rows){
+              if((r.all?.goals?.for ?? 0) > (bestAttack.all?.goals?.for ?? 0)) bestAttack = r;
+              if((r.all?.goals?.against ?? 0) < (bestDefense.all?.goals?.against ?? 999)) bestDefense = r;
+            }
+            const insights = [
+              { type:'best_attack', text:`Miglior attacco: ${bestAttack.team?.name} (${bestAttack.all?.goals?.for} GF)` },
+              { type:'best_defense', text:`Miglior difesa: ${bestDefense.team?.name} (${bestDefense.all?.goals?.against} GS)` }
+            ];
+            return NextResponse.json({ insights });
+          }
+          EOF
+
+          cat > app/api/match/[id]/summary/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          import { formIndex } from '@/core/metrics/formIndex';
+
+          export async function GET(_: Request, { params }:{ params: { id: string }} ){
+            const fx = (await (adapter.getFixture ? adapter.getFixture(params.id) : null));
+            if(!fx) return NextResponse.json({ error: 'Fixture non trovato' }, { status: 404 });
+
+            const [homeFormGames, awayFormGames, h2hGames, injuriesHome, injuriesAway, lineups, odds] = await Promise.all([
+              adapter.getTeamForm(fx.home.id, 5),
+              adapter.getTeamForm(fx.away.id, 5),
+              adapter.getH2H(fx.home.id, fx.away.id, 5),
+              adapter.getInjuries ? adapter.getInjuries(fx.home.id) : Promise.resolve([]),
+              adapter.getInjuries ? adapter.getInjuries(fx.away.id) : Promise.resolve([]),
+              adapter.getLineups ? adapter.getLineups(fx.id) : Promise.resolve(null),
+              adapter.getOdds ? adapter.getOdds(fx.id) : Promise.resolve([]),
+            ]);
+
+            const homeForm = formIndex(homeFormGames);
+            const awayForm = formIndex(awayFormGames);
+            const h2h = h2hGames.map(g=>g.result);
+
+            return NextResponse.json({
+              ...fx,
+              homeForm, awayForm, h2h,
+              injuries: { home: injuriesHome, away: injuriesAway },
+              lineups, odds
+            });
+          }
+          EOF
+
+          cat > app/api/export/match/[id]/route.ts <<'EOF'
+          import { NextResponse } from 'next/server';
+          import { adapter } from '@/core/adapters';
+          import { formIndex } from '@/core/metrics/formIndex';
+          import { Document, Page, Text, View, StyleSheet, pdf } from '@react-pdf/renderer';
+          export const dynamic = 'force-dynamic';
+          export async function GET(_: Request, { params }:{ params: { id: string }} ){
+            const fx = (await (adapter.getFixture ? adapter.getFixture(params.id) : null));
+            if(!fx) return NextResponse.json({ error: 'Fixture non trovato' }, { status: 404 });
+            const [homeFormGames, awayFormGames] = await Promise.all([
+              adapter.getTeamForm(fx.home.id, 5),
+              adapter.getTeamForm(fx.away.id, 5)
+            ]);
+            const homeForm = formIndex(homeFormGames); const awayForm = formIndex(awayFormGames);
+            const styles = StyleSheet.create({ page:{ padding:24 }, h1:{ fontSize:18, marginBottom:8 }, small:{ fontSize:10, color:'#444' } });
+            const Doc = (
+              <Document>
+                <Page size="A4" style={styles.page}>
+                  <Text style={styles.h1}>{fx.home.name} vs {fx.away.name}</Text>
+                  <Text style={styles.small}>{fx.venue?.name ?? '—'}{fx.venue?.city ? `, ${fx.venue.city}`:''} • {new Date(fx.dateUtc).toLocaleString()}</Text>
+                  <View style={{ marginTop:16 }}>
+                    <Text>Indice forma Home: {homeForm.score}/100 ({homeForm.short})</Text>
+                    <Text>Indice forma Away: {awayForm.score}/100 ({awayForm.short})</Text>
+                  </View>
+                </Page>
+              </Document>
+            );
+            const file = await pdf(Doc).toBuffer();
+            return new NextResponse(file, { headers: { 'content-type':'application/pdf', 'content-disposition': `inline; filename="match-${params.id}.pdf"` }});
+          }
+          EOF
+
+          # --- core utils/metrics/adapters ---
+          mkdir -p core/utils core/metrics core/adapters
+          cat > core/utils/time.ts <<'EOF'
+          export const fmtLocal = (iso: string, tz?: string) => new Date(iso).toLocaleString(undefined, { hour: '2-digit', minute: '2-digit', day: '2-digit', month: '2-digit', timeZone: tz });
+          EOF
+
+          cat > core/metrics/formIndex.ts <<'EOF'
+          import type { FormGame } from "../adapters/types";
+          const W = [0.35, 0.25, 0.20, 0.12, 0.08];
+          export function formIndex(games: FormGame[]) {
+            const n = Math.min(5, games.length);
+            if (n === 0) return { score: 0, trend: 'flat' as const, short: '—' };
+            let total = 0; const max = 3 * n; let short = '';
+            for (let i = 0; i < n; i++) {
+              const g = games[i]; short += g.result;
+              let base = g.result === 'W' ? 3 : g.result === 'D' ? 1 : 0;
+              if (g.cleanSheet) base += 0.1;
+              if ((g.xgDiff ?? 0) >= 0.3) base += 0.1;
+              if ((g.redCards ?? 0) > 0) base -= 0.1;
+              if ((g.awayAltitude ?? 0) >= 1000) base += 0.05;
+              total += base * W[i];
+            }
+            const denom = max * W.slice(0, n).reduce((a,b)=>a+b,0);
+            const score = Math.round(Math.max(0, Math.min(100, (total/denom)*100)));
+            const trend = n >= 3 ? (short[0] === 'W' && short[2] !== 'W' ? 'up' : short[0] === 'L' && short[2] !== 'L' ? 'down' : 'flat') : 'flat';
+            return { score, trend, short };
+          }
+          EOF
+
+          cat > core/adapters/types.ts <<'EOF'
+          export type Country = { id: string; name: string; iso2?: string };
+          export type League = { id: string; name: string; type: 'league'|'cup'; country?: string };
+          export type Team = { id: string; name: string; short?: string; logo?: string };
+          export type FixtureTeam = { id: string; name: string; logo?: string };
+          export type Fixture = {
+            id: string;
+            leagueId: string;
+            season: number;
+            dateUtc: string;
+            venue?: { name?: string; city?: string; tz?: string };
+            home: FixtureTeam;
+            away: FixtureTeam;
+            round?: string;
+            status?: string;
+            odds?: { oneXtwo?: [number, number, number] };
+            homeForm?: { short: string; score: number };
+            awayForm?: { short: string; score: number };
+          };
+          export type FormGame = { result: 'W'|'D'|'L'; xgDiff?: number; cleanSheet?: boolean; redCards?: number; awayAltitude?: number };
+          export interface FootballAdapter {
+            name: string;
+            getCountries(): Promise<Country[]>;
+            getLeagues(country: string): Promise<League[]>;
+            getSeasons(leagueId: string): Promise<number[]>;
+            getFixtures(params: { leagueId: string; season: number; from: string; to: string }): Promise<Fixture[]>;
+            getFixture?(fixtureId: string): Promise<Fixture | null>;
+            getTeamForm(teamId: string, n?: number): Promise<FormGame[]>;
+            getH2H(aTeamId: string, bTeamId: string, n?: number): Promise<FormGame[]>;
+            getStandings(leagueId: string, season: number): Promise<any[]>;
+            getInjuries?(teamId: string): Promise<Array<{ player: string; position?: string; status?: string; expected_return?: string }>>;
+            getLineups?(fixtureId: string): Promise<{ home?: { formation?: string; xi?: string[]; bench?: string[] }; away?: { formation?: string; xi?: string[]; bench?: string[] } }|null>;
+            getOdds?(fixtureId: string): Promise<{ market: string; outcomes: Array<{ name: string; value: number }> }[]>;
+          }
+          EOF
+
+          cat > core/adapters/apifootball.ts <<'EOF'
+          import type { FootballAdapter, Country, League, Fixture } from "./types";
+          const BASE = process.env.API_FOOTBALL_BASE!;
+          const headers = () => ({
+            'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
+            'x-rapidapi-host': process.env.RAPIDAPI_HOST || 'api-football-v1.p.rapidapi.com'
+          });
+          async function api(path: string, search?: Record<string,string|number>) {
+            const url = new URL(path, BASE);
+            if (search) Object.entries(search).forEach(([k,v]) => url.searchParams.set(k, String(v)));
+            const res = await fetch(url, { headers: headers(), cache: 'no-store' });
+            if (!res.ok) throw new Error(`API ${res.status}`);
+            const json = await res.json();
+            return json.response as any[];
+          }
+          export const apiFootballAdapter: FootballAdapter = {
+            name: 'api-football',
+            async getCountries(): Promise<Country[]> {
+              const r = await api('/countries');
+              return r.map((c:any) => ({ id: c.name, name: c.name, iso2: c.code }));
+            },
+            async getLeagues(country: string) {
+              const r = await api('/leagues', { country });
+              return r.map((x:any) => ({ id: String(x.league.id), name: x.league.name, type: x.league.type.toLowerCase(), country: x.country.name }));
+            },
+            async getSeasons(leagueId: string) {
+              const r = await api('/leagues', { id: leagueId });
+              const s = r[0]?.seasons?.map((s:any) => s.year).sort((a:number,b:number)=>b-a) ?? [];
+              return s;
+            },
+            async getFixtures({ leagueId, season, from, to }) {
+              const r = await api('/fixtures', { league: leagueId, season, from, to });
+              const fixtures: Fixture[] = r.map((f:any) => ({
+                id: String(f.fixture.id),
+                leagueId: String(leagueId),
+                season,
+                dateUtc: f.fixture.date,
+                venue: { name: f.fixture.venue?.name, city: f.fixture.venue?.city, tz: f.fixture.timezone },
+                home: { id: String(f.teams.home.id), name: f.teams.home.name, logo: f.teams.home.logo },
+                away: { id: String(f.teams.away.id), name: f.teams.away.name, logo: f.teams.away.logo },
+                round: f.league.round,
+                status: f.fixture.status?.short,
+              }));
+              return fixtures;
+            },
+            async getTeamForm(teamId: string, n = 5) {
+              const r = await api('/fixtures', { team: teamId, last: n });
+              return r.map((f:any) => ({
+                result: (String(f.teams.home.id) === teamId && f.teams.home.winner) || (String(f.teams.away.id) === teamId && f.teams.away.winner) ? 'W' : (f.goals.home === f.goals.away ? 'D' : 'L'),
+                xgDiff: undefined,
+                cleanSheet: (String(f.teams.home.id) === teamId ? f.goals.away : f.goals.home) === 0,
+                redCards: 0
+              }));
+            },
+            async getH2H(a: string, b: string, n = 5) {
+              const r = await api('/fixtures/headtohead', { h2h: `${a}-${b}`, last: n });
+              return r.map((f:any) => ({ result: f.goals.home === f.goals.away ? 'D' : (f.teams.home.winner ? (String(f.teams.home.id)===a?'W':'L') : (String(f.teams.away.id)===a?'L':'W')) }));
+            },
+            async getStandings(leagueId: string, season: number) {
+              const r = await api('/standings', { league: leagueId, season });
+              return r[0]?.league?.standings?.[0] ?? [];
+            },
+            async getInjuries(teamId: string){
+              const r = await api('/injuries', { team: teamId });
+              return r.map((x:any)=>({ player: x.player?.name, position: x.player?.position, status: x.player?.type, expected_return: x.player?.reason }));
+            },
+            async getLineups(fixtureId: string){
+              const r = await api('/fixtures/lineups', { fixture: fixtureId });
+              if(!r?.length) return null;
+              const map = (obj:any)=> obj ? { formation: obj.formation, xi: obj.startXI?.map((p:any)=>p.player?.name) ?? [], bench: obj.substitutes?.map((p:any)=>p.player?.name) ?? [] } : undefined;
+              return { home: map(r[0]), away: map(r[1]) };
+            },
+            async getOdds(fixtureId: string){
+              const r = await api('/odds', { fixture: fixtureId });
+              const items = r?.[0]?.bookmakers?.[0]?.bets ?? [];
+              return items.map((b:any)=>({ market: b.name, outcomes: (b.values||[]).map((v:any)=>({ name: v.value, value: Number(v.odd) })) }));
+            }
+          };
+          EOF
+
+          cat > core/adapters/mock.ts <<'EOF'
+          import type { FootballAdapter, Fixture, League } from './types';
+          function daysFromNow(d:number){ return new Date(Date.now()+d*86400000).toISOString(); }
+          export const mockAdapter: FootballAdapter = {
+            name: 'mock',
+            async getCountries(){ return [{ id:'Italy', name:'Italy'},{ id:'England', name:'England'}]; },
+            async getLeagues(country){ const m:Record<string,League[]> = { Italy:[{ id:'135', name:'Serie A', type:'league'}], England:[{ id:'39', name:'Premier League', type:'league'}]}; return m[country] ?? []; },
+            async getSeasons(){ return [2024,2023,2022]; },
+            async getFixtures({ leagueId, season }){ const mk=(i:number):Fixture=>({ id:`${leagueId}-${i}`, leagueId, season, dateUtc:daysFromNow(i), home:{id:'h'+i,name:`Home ${i}`}, away:{id:'a'+i,name:`Away ${i}`}, round:`Round ${i}`, status:'NS', homeForm:{short:'WWDLW',score:72}, awayForm:{short:'LDLWW',score:55}}); return Array.from({length:6},(_,i)=>mk(i+1)); },
+            async getTeamForm(){ return [{result:'W'},{result:'D'},{result:'L'},{result:'W'},{result:'W'}]; },
+            async getH2H(){ return [{result:'W'},{result:'L'},{result:'D'},{result:'W'},{result:'L'}]; },
+            async getStandings(){ return []; },
+            async getInjuries(){ return [{ player:'Giocatore 1', position:'FW', status:'Injury', expected_return:'TBD' }]; },
+            async getLineups(){ return { home:{ formation:'4-3-3', xi:['H1','H2','H3'], bench:['HB1','HB2']}, away:{ formation:'3-5-2', xi:['A1','A2','A3'], bench:['AB1','AB2']} }; },
+            async getOdds(){ return [ { market:'1X2', outcomes:[{name:'1', value:1.85},{name:'X', value:3.4},{name:'2', value:4.2}] } ]; }
+          };
+          EOF
+
+          cat > core/adapters/index.ts <<'EOF'
+          import type { FootballAdapter, Fixture } from './types';
+          import { apiFootballAdapter } from './apifootball';
+          import { mockAdapter } from './mock';
+
+          const buildApiAdapterWithGet: () => FootballAdapter = () => {
+            const base = apiFootballAdapter as FootballAdapter;
+            const getFixture = async (fixtureId: string): Promise<Fixture | null> => {
+              const BASE = process.env.API_FOOTBALL_BASE!;
+              const headers = {
+                'x-rapidapi-key': process.env.RAPIDAPI_KEY!,
+                'x-rapidapi-host': process.env.RAPIDAPI_HOST || 'api-football-v1.p.rapidapi.com'
+              } as Record<string, string>;
+              const url = new URL('/fixtures', BASE);
+              url.searchParams.set('id', fixtureId);
+              const res = await fetch(url, { headers, cache: 'no-store' });
+              if (!res.ok) return null;
+              const json = await res.json();
+              const f = json?.response?.[0];
+              if(!f) return null;
+              return {
+                id: String(f.fixture.id),
+                leagueId: String(f.league.id),
+                season: Number(f.league.season),
+                dateUtc: f.fixture.date,
+                venue: { name: f.fixture.venue?.name, city: f.fixture.venue?.city, tz: f.fixture.timezone },
+                home: { id: String(f.teams.home.id), name: f.teams.home.name, logo: f.teams.home.logo },
+                away: { id: String(f.teams.away.id), name: f.teams.away.name, logo: f.teams.away.logo },
+                round: f.league.round,
+                status: f.fixture.status?.short,
+              } as Fixture;
+            };
+            return { ...base, getFixture } as FootballAdapter;
+          };
+
+          const buildMockAdapterWithGet: () => FootballAdapter = () => {
+            const base = mockAdapter as FootballAdapter;
+            const getFixture = async (fixtureId: string): Promise<Fixture | null> => ({
+              id: fixtureId,
+              leagueId: '135',
+              season: 2024,
+              dateUtc: new Date().toISOString(),
+              home: { id:'h1', name:'Team A' },
+              away: { id:'a1', name:'Team B' },
+              round: 'Round 1',
+              status: 'NS'
+            });
+            return { ...base, getFixture } as FootballAdapter;
+          };
+
+          export const adapter: FootballAdapter = process.env.RAPIDAPI_KEY ? buildApiAdapterWithGet() : buildMockAdapterWithGet();
+          EOF
+
+          # --- public ---
+          mkdir -p public
+          cat > public/manifest.json <<'EOF'
+          {
+            "name": "Statistiche Calcio Global",
+            "short_name": "CalcioStats",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#0a0a0a",
+            "theme_color": "#0a0a0a",
+            "icons": [
+              { "src": "/icons/icon-192.png", "sizes": "192x192", "type": "image/png" },
+              { "src": "/icons/icon-512.png", "sizes": "512x512", "type": "image/png" }
+            ]
+          }
+          EOF
+
+      - name: Commit & push
+        run: |
+          set -e
+          git config user.name "calcio-stats-seeder"
+          git config user.email "actions@github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "seed: bootstrap progetto calcio-stats"
+            git push
+          fi
